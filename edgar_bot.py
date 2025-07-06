@@ -4,7 +4,7 @@ import feedparser
 import requests
 import yfinance as yf
 from bs4 import BeautifulSoup
-from datetime import datetime
+from datetime import datetime, timezone
 
 # === CONFIGURATION ===
 BOT_TOKEN = "7210512521:AAHMMoqnVfGP-3T2drsOvUi_FgXmxfTiNgI"
@@ -47,6 +47,7 @@ FEEDS = {
 sent_links = set()
 
 def send_telegram_message(text: str):
+    """Send a Markdown-formatted message via Telegram."""
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     resp = requests.post(url, data={
         "chat_id": CHAT_ID,
@@ -57,6 +58,7 @@ def send_telegram_message(text: str):
         print(f"[Telegram] Error {resp.status_code}: {resp.text}", flush=True)
 
 def extract_price_info(url: str):
+    """Fetch the page at `url` and extract offer price and declared premium."""
     try:
         html = requests.get(url, headers=HEADERS, timeout=10).text
         text = BeautifulSoup(html, "html.parser").get_text(" ")
@@ -70,6 +72,7 @@ def extract_price_info(url: str):
         return None, None
 
 def get_current_price_and_ticker(name: str):
+    """Try to resolve `name` as a ticker via yfinance and fetch its current price."""
     try:
         t = yf.Ticker(name)
         info = t.info
@@ -80,9 +83,10 @@ def get_current_price_and_ticker(name: str):
     except:
         pass
     try:
-        data = requests.get(f"https://query2.finance.yahoo.com/v1/finance/search?q={name}", timeout=10).json()
-        if data.get("quotes"):
-            sym   = data["quotes"][0]["symbol"]
+        resp = requests.get(f"https://query2.finance.yahoo.com/v1/finance/search?q={name}", timeout=10).json()
+        quotes = resp.get("quotes") or []
+        if quotes:
+            sym   = quotes[0]["symbol"]
             price = yf.Ticker(sym).info.get("regularMarketPrice")
             return price, sym
     except:
@@ -90,11 +94,12 @@ def get_current_price_and_ticker(name: str):
     return None, None
 
 def check_all_feeds():
-    now = datetime.utcnow().isoformat() + "Z"
+    """Poll each feed, filter M&A items, extract data and send Telegram alerts."""
+    now = datetime.now(timezone.utc).isoformat()
     for market, cfg in FEEDS.items():
         try:
             feed = feedparser.parse(cfg["url"])
-            entries = getattr(feed, "entries", [])
+            entries = feed.entries or []
         except Exception as e:
             print(f"[{market}] Feed parse error: {e}", flush=True)
             continue
@@ -132,16 +137,17 @@ def check_all_feeds():
             send_telegram_message(msg)
             sent_links.add(link)
 
-        time.sleep(1)  # throttle between feeds
+        time.sleep(1)  # gentle throttle between different feeds
 
 def run_monitor():
+    """Main loop: poll all feeds every 60 seconds."""
     while True:
-        print(f"{datetime.utcnow().isoformat()}Z ▶️ Polling all feeds...", flush=True)
+        print(f"{datetime.now(timezone.utc).isoformat()} ▶️ Polling all feeds...", flush=True)
         try:
             check_all_feeds()
         except Exception as e:
             print(f"[run_monitor] Error: {e}", flush=True)
-        time.sleep(60)  # 1 minute interval
+        time.sleep(60)
 
 if __name__ == "__main__":
     run_monitor()
