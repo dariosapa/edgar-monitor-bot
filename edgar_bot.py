@@ -135,7 +135,8 @@ def check_all_feeds():
             current_price, ticker = get_current_price_and_ticker(company_name)
 
             # build the Telegram message
-            msg  = f"{datetime.now().isoformat()} 📢 *{market} M&A Alert!*\n"
+            now = datetime.now().isoformat()
+            msg  = f"{now} 📢 *{market} M&A Alert!*\n"
             msg += f"📌 *Title:* {title}\n"
             msg += f"📅 *Date:* {published}\n"
             if price_offered is not None:
@@ -157,12 +158,14 @@ def check_all_feeds():
 def run_monitor():
     """Main loop: poll all feeds every 10 seconds for testing (switch back to 60 sec)."""
     while True:
+        now = datetime.now().isoformat()
         try:
-            print(f"{datetime.now().isoformat()} ▶️ Polling all configured feeds...", flush=True)
+            print(f"{now} ▶️ Polling all configured feeds…", flush=True)
             check_all_feeds()
+            print(f"{now} ✅ check_all_feeds() completed", flush=True)
         except Exception as e:
-            print(f"[run_monitor] Unexpected error: {e}", flush=True)
-        time.sleep(10)  # testing interval
+            print(f"{now} ❌ run_monitor error: {e}", flush=True)
+        time.sleep(10)
 
 if __name__ == "__main__":
     run_monitor()
