@@ -7,71 +7,99 @@ from bs4 import BeautifulSoup
 
 # === CONFIGURATION ===
 BOT_TOKEN = "7210512521:AAHMMoqnVfGP-3T2drsOvUi_FgXmxfTiNgI"
-CHAT_ID = "687693382"
-RELEVANT_FORMS = ["8-K", "SC TO-C", "S-4", "SC 13D", "DEFM14A"]
-SEC_RSS_URL = "https://www.sec.gov/Archives/edgar/usgaap.rss.xml"
-HEADERS = {'User-Agent': 'M&A Pulse Bot (email@example.com)'}
+CHAT_ID   = "687693382"
+HEADERS   = {'User-Agent': 'M&A Pulse Bot (email@example.com)'}
 
-# memory of already sent links to avoid duplicates
+# Define feeds and their matching keywords/forms
+FEEDS = {
+    "USA (SEC EDGAR)": {
+        "url": "https://www.sec.gov/Archives/edgar/usgaap.rss.xml",
+        "keywords": ["8-K", "SC TO-C", "S-4", "SC 13D", "DEFM14A"]
+    },
+    "Canada (SEDAR+)": {
+        "url": "https://www.sedarplus.ca/files?format=rss",
+        "keywords": ["acquisition", "merger", "offer"]
+    },
+    "UK (LSE RNS)": {
+        "url": "https://www.londonstockexchange.com/rss/news.rss",
+        "keywords": ["acquisition", "merger", "offer"]
+    },
+    "Australia (ASX)": {
+        "url": "https://www.asx.com.au/asx/statistics/rssAnnounce.xml",
+        "keywords": ["acquisition", "merger", "offer"]
+    },
+    "Hong Kong (HKEX)": {
+        "url": "https://www1.hkexnews.hk/rss/ListedCompanyNew.xml",
+        "keywords": ["acquisition", "merger", "offer"]
+    },
+    "PR Newswire": {
+        "url": "https://www.prnewswire.com/rss/news-releases/finance-and-business",
+        "keywords": ["acquisition", "merger", "offer"]
+    },
+    "BusinessWire": {
+        "url": "https://www.businesswire.com/portal/site/home/rss/announcements.xml",
+        "keywords": ["acquisition", "merger", "offer"]
+    }
+}
+
+# Memory to avoid duplicate notifications
 sent_links = set()
 
-def send_telegram_message(message: str):
-    """Send a Markdown-formatted message to the Telegram chat."""
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {
-        'chat_id': CHAT_ID,
-        'text': message,
-        'parse_mode': 'Markdown'
-    }
-    resp = requests.post(url, data=payload)
+def send_telegram_message(text: str):
+    """Send a Markdown-formatted message via Telegram Bot."""
+    api_url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    resp = requests.post(api_url, data={
+        "chat_id": CHAT_ID,
+        "text": text,
+        "parse_mode": "Markdown"
+    })
     if resp.status_code != 200:
-        print(f"Telegram error: {resp.status_code} – {resp.text}")
+        print(f"Telegram error {resp.status_code}: {resp.text}")
 
-def extract_price_info(filing_url: str):
+def extract_price_info(url: str):
     """
-    Download the filing HTML and extract:
-    - offer price per share (e.g. "$54.00")
+    Download the page at `url` and parse out:
+    - offered price per share (e.g. "$54.00")
     - declared premium percentage (e.g. "22%")
+    Returns (price_offered: float|None, declared_premium: float|None)
     """
     try:
-        html = requests.get(filing_url, headers=HEADERS).text
-        soup = BeautifulSoup(html, 'html.parser')
-        text = soup.get_text(separator=' ')
-
-        # Search for patterns like "offer price at $XX.XX" or "will pay $XX.XX"
-        price_match = re.search(r"(?:offer(?:s|ed)?|pay(?:s|ing)?|price(?:d)? at)\s+\$([\d\.]+)", text, re.IGNORECASE)
-        price_offered = float(price_match.group(1)) if price_match else None
-
-        # Search for "premium of XX%"
-        premium_match = re.search(r"premium of\s+([\d\.]+)%", text, re.IGNORECASE)
-        premium_pct = float(premium_match.group(1)) if premium_match else None
-
-        return price_offered, premium_pct
+        html = requests.get(url, headers=HEADERS, timeout=10).text
+        text = BeautifulSoup(html, "html.parser").get_text(separator=" ")
+        # look for "$XX.XX" after keywords
+        price_m = re.search(r"(?:offer(?:s|ed)?|pay(?:s|ing)?|price(?:d)? at)\s+\$([\d\.]+)", text, re.IGNORECASE)
+        premium_m = re.search(r"premium of\s+([\d\.]+)%", text, re.IGNORECASE)
+        price_offered = float(price_m.group(1)) if price_m else None
+        declared_premium = float(premium_m.group(1)) if premium_m else None
+        return price_offered, declared_premium
     except Exception as e:
-        print(f"Error parsing filing: {e}")
+        print(f"[extract_price_info] Error: {e}")
         return None, None
 
-def get_price_from_company_name(name: str):
+def get_current_price_and_ticker(company_name: str):
     """
-    Try to resolve the company's ticker from its name and fetch current market price.
-    Returns (current_price, ticker) or (None, None).
+    Attempt to resolve a ticker from company_name and fetch its current price.
+    Returns (current_price: float|None, ticker: str|None).
     """
+    # 1) Directly try company_name as ticker
     try:
-        # Directly try name as ticker
-        ticker_obj = yf.Ticker(name)
-        price = ticker_obj.info.get('regularMarketPrice')
-        symbol = ticker_obj.info.get('symbol')
+        t = yf.Ticker(company_name)
+        info = t.info
+        price = info.get("regularMarketPrice")
+        symbol = info.get("symbol")
         if price:
             return price, symbol
     except Exception:
         pass
 
+    # 2) Fallback: search endpoint
     try:
-        # Fallback: search via Yahoo Finance search API
-        query_url = f"https://query2.finance.yahoo.com/v1/finance/search?q={name}&lang=en-US"
-        data = requests.get(query_url).json()
-        if data.get("quotes"):
-            symbol = data["quotes"][0]["symbol"]
+        resp = requests.get(
+            f"https://query2.finance.yahoo.com/v1/finance/search?q={company_name}&lang=en-US",
+            timeout=10
+        ).json()
+        if resp.get("quotes"):
+            symbol = resp["quotes"][0]["symbol"]
             price = yf.Ticker(symbol).info.get("regularMarketPrice")
             return price, symbol
     except Exception:
@@ -79,53 +107,53 @@ def get_price_from_company_name(name: str):
 
     return None, None
 
-def check_edgar_feed():
-    """Check the EDGAR RSS feed for relevant M&A filings."""
-    feed = feedparser.parse(SEC_RSS_URL)
-    for entry in feed.entries[:15]:
-        title = entry.title
-        link = entry.link
-        published = entry.published
+def check_all_feeds():
+    """Poll each feed, filter announcements, extract data, and send Telegram alert."""
+    for market, cfg in FEEDS.items():
+        feed = feedparser.parse(cfg["url"])
+        entries = getattr(feed, "entries", [])
+        for entry in entries[:10]:
+            link = entry.link
+            title = entry.title
+            published = getattr(entry, "published", "")
+            if link in sent_links:
+                continue
 
-        # Skip if already sent
-        if link in sent_links:
-            continue
-
-        for form in RELEVANT_FORMS:
-            if form in title:
-                company = title.split(" - ")[0].strip()
+            # Case-insensitive keyword match in title or summary
+            text_block = title + " " + getattr(entry, "summary", "")
+            if any(kw.lower() in text_block.lower() for kw in cfg["keywords"]):
+                # Extract price info if available
                 price_offered, declared_premium = extract_price_info(link)
-                current_price, ticker = get_price_from_company_name(company)
+                # Attempt to get current market price
+                # Use the title as company_name heuristic
+                company_name = re.split(r"\s[-–]\s", title)[0].strip()
+                current_price, ticker = get_current_price_and_ticker(company_name)
 
-                # Build the message
-                msg = "📢 *New M&A announcement detected!*\n"
-                msg += f"📌 *Filing:* `{form}`\n"
-                msg += f"🏢 *Company:* {company}"
-                if ticker:
-                    msg += f" ({ticker})"
-                msg += f"\n📅 *Date:* {published}"
-
-                if price_offered:
-                    msg += f"\n💰 *Offer price:* ${price_offered:.2f}"
-                if current_price:
-                    msg += f"\n📈 *Current price:* ${current_price:.2f}"
+                # Build the notification message
+                msg = f"📢 *{market} M&A Alert!*\n"
+                msg += f"📌 *Title:* {title}\n"
+                msg += f"📅 *Date:* {published}\n"
+                if price_offered is not None:
+                    msg += f"💰 *Offer price:* ${price_offered:.2f}\n"
+                if current_price is not None:
+                    msg += f"📈 *Current price:* ${current_price:.2f}\n"
                 if declared_premium is not None:
-                    msg += f"\n💹 *Stated premium:* +{declared_premium:.2f}%"
-                elif price_offered and current_price:
-                    calc_premium = ((price_offered - current_price) / current_price) * 100
-                    msg += f"\n💹 *Estimated premium:* +{calc_premium:.2f}%"
-
-                msg += f"\n🔗 [Open Filing]({link})"
+                    msg += f"💹 *Stated premium:* +{declared_premium:.2f}%\n"
+                elif price_offered is not None and current_price is not None:
+                    est_premium = (price_offered - current_price) / current_price * 100
+                    msg += f"💹 *Estimated premium:* +{est_premium:.2f}%\n"
+                msg += f"🔗 [Open announcement]({link})"
 
                 send_telegram_message(msg)
                 sent_links.add(link)
-                break
+
+        time.sleep(1)  # throttle between feeds
 
 def run_monitor():
-    """Main loop: check EDGAR every 60 seconds."""
+    """Main loop: run check_all_feeds() every 60 seconds."""
     while True:
-        print("🔍 Checking EDGAR feed...")
-        check_edgar_feed()
+        print("▶️ Polling all configured feeds...")
+        check_all_feeds()
         time.sleep(60)
 
 if __name__ == "__main__":
