@@ -50,7 +50,7 @@ def send_telegram_message(message: str):
     else:
         print("✅ Telegram message sent.")
 
-# === SEC FILINGS ===
+# === SEC PARSING ===
 def extract_price_info(filing_url: str):
     try:
         html = requests.get(filing_url, headers=HEADERS, timeout=10).text
@@ -90,6 +90,7 @@ def get_price_from_company_name(name: str):
 
     return None, None
 
+# === SEC MONITOR ===
 def check_edgar_feed():
     try:
         feed = feedparser.parse(SEC_RSS_URL)
@@ -134,7 +135,7 @@ def check_edgar_feed():
     except Exception as e:
         print(f"❌ Error reading SEC feed: {e}")
 
-# === PR NEWSWIRE ===
+# === PR NEWSWIRE MONITOR ===
 def check_prn_feed():
     try:
         feed = feedparser.parse(PRN_RSS_URL)
@@ -160,7 +161,7 @@ def check_prn_feed():
     except Exception as e:
         print(f"❌ Error reading PRNewswire feed: {e}")
 
-# === LSE RNS ===
+# === LSE RNS MONITOR ===
 def check_lse_feed():
     try:
         url = "https://www.londonstockexchange.com/api/news/search"
@@ -173,11 +174,13 @@ def check_lse_feed():
             "pageSize": 20
         }
         headers = {
-            "User-Agent": "Mozilla/5.0",
-            "Accept": "application/json"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "application/json",
+            "Referer": "https://www.londonstockexchange.com/news?tab=news-explorer",
+            "Origin": "https://www.londonstockexchange.com"
         }
 
-        response = requests.get(url, headers=headers, params=params)
+        response = requests.get(url, headers=headers, params=params, timeout=10)
         data = response.json()
 
         for item in data.get("news", []):
@@ -202,8 +205,12 @@ def check_lse_feed():
                     break
     except Exception as e:
         print(f"❌ Error fetching LSE feed: {e}")
+        try:
+            print("ℹ️ Response content:", response.text[:300])
+        except:
+            pass
 
-# === MONITOR LOOP ===
+# === MAIN LOOP ===
 def run_monitor():
     while True:
         try:
