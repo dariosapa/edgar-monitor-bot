@@ -6,7 +6,7 @@ import re
 import json
 from bs4 import BeautifulSoup
 
-# === CONFIGURATION ===
+# === CONFIG ===
 BOT_TOKEN = "7210512521:AAHMMoqnVfGP-3T2drsOvUi_FgXmxfTiNgI"
 CHAT_ID = "687693382"
 
@@ -16,10 +16,9 @@ RELEVANT_FORMS = ["8-K", "SC TO-C", "S-4", "SC 13D", "DEFM14A"]
 PRN_RSS_URL = "https://www.prnewswire.com/rss/finance-business-news.rss"
 PRN_KEYWORDS = ["acquires", "acquisition", "buyout", "merger", "merging", "combine", "offer", "purchase"]
 
-LSE_KEYWORDS = ["acquisition", "recommended offer", "offer for", "to acquire", "merger"]
-
-HEADERS = {'User-Agent': 'M&A Pulse Bot (email@example.com)'}
 LINKS_FILE = "sent_links.json"
+HEADERS = {'User-Agent': 'M&A Pulse Bot (email@example.com)'}
+
 sent_links = set()
 
 # === STORAGE ===
@@ -50,7 +49,7 @@ def send_telegram_message(message: str):
     else:
         print("✅ Telegram message sent.")
 
-# === SEC PARSING ===
+# === PRICE EXTRACT ===
 def extract_price_info(filing_url: str):
     try:
         html = requests.get(filing_url, headers=HEADERS, timeout=10).text
@@ -135,7 +134,7 @@ def check_edgar_feed():
     except Exception as e:
         print(f"❌ Error reading SEC feed: {e}")
 
-# === PR NEWSWIRE MONITOR ===
+# === PRN MONITOR ===
 def check_prn_feed():
     try:
         feed = feedparser.parse(PRN_RSS_URL)
@@ -161,54 +160,9 @@ def check_prn_feed():
     except Exception as e:
         print(f"❌ Error reading PRNewswire feed: {e}")
 
-# === LSE RNS MONITOR ===
-def check_lse_feed():
-    try:
-        url = "https://www.londonstockexchange.com/api/news/search"
-        params = {
-            "tab": "news-explorer",
-            "category": "",
-            "headlinetypes": "RNS",
-            "keyword": "",
-            "page": 1,
-            "pageSize": 20
-        }
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "application/json",
-            "Referer": "https://www.londonstockexchange.com/news?tab=news-explorer",
-            "Origin": "https://www.londonstockexchange.com"
-        }
-
-        response = requests.get(url, headers=headers, params=params, timeout=10)
-        data = response.json()
-
-        for item in data.get("news", []):
-            headline = item.get("headline", "").lower()
-            link = f"https://www.londonstockexchange.com{item.get('canonicalUrl', '')}"
-
-            if link in sent_links:
-                continue
-
-            for keyword in LSE_KEYWORDS:
-                if keyword in headline:
-                    msg = "🇬🇧 *LSE RNS: Possible M&A announcement!*\n"
-                    msg += f"🔑 *Keyword:* `{keyword}`\n"
-                    msg += f"🗞️ *Headline:* {item.get('headline')}\n"
-                    msg += f"📅 *Date:* {item.get('marketNewsDate')}\n"
-                    msg += f"🔗 [Read More]({link})"
-
-                    send_telegram_message(msg)
-                    sent_links.add(link)
-                    save_sent_links()
-                    print(f"✅ LSE alert sent: {item.get('headline')}")
-                    break
-    except Exception as e:
-        print(f"❌ Error fetching LSE feed: {e}")
-        try:
-            print("ℹ️ Response content:", response.text[:300])
-        except:
-            pass
+# === LSE DISATTIVATO (da riattivare in futuro) ===
+# def check_lse_feed():
+#     pass
 
 # === MAIN LOOP ===
 def run_monitor():
@@ -218,8 +172,8 @@ def run_monitor():
             check_edgar_feed()
             print("🔍 Checking PRNewswire feed...")
             check_prn_feed()
-            print("🔍 Checking LSE RNS feed...")
-            check_lse_feed()
+            # print("🔍 Checking LSE feed...")
+            # check_lse_feed()
         except Exception as e:
             print(f"❌ Unexpected error in main loop: {e}")
         time.sleep(60)
@@ -228,5 +182,5 @@ def run_monitor():
 if __name__ == "__main__":
     print("🚀 M&A Pulse Bot is running...")
     load_sent_links()
-    send_telegram_message("🟢 *Bot started: monitoring SEC + PRNewswire + LSE*")
+    send_telegram_message("🟢 *Bot started: monitoring SEC + PRNewswire*")
     run_monitor()
