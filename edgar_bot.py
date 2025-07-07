@@ -7,23 +7,47 @@ from bs4 import BeautifulSoup
 from datetime import datetime, timezone
 
 # === CONFIGURATION ===
-BOT_TOKEN       = "7210512521:AAHMMoqnVfGP-3T2drsOvUi_FgXmxfTiNgI"
-CHAT_ID         = "687693382"
-SEC_RSS_URL     = "https://www.sec.gov/Archives/edgar/usgaap.rss.xml"
-PRN_RSS_URL     = "https://www.prnewswire.com/rss/news-releases-list.rss"
-HEADERS         = {'User-Agent': 'M&A Pulse Bot (email@example.com)'}
-RELEVANT_FORMS  = ["8-K", "SC TO-C", "S-4", "SC 13D", "DEFM14A"]
-PRN_KEYWORDS    = ["acquire", "acquisition", "merger", "buyout", "takeover"]
+BOT_TOKEN    = "7210512521:AAHMMoqnVfGP-3T2drsOvUi_FgXmxfTiNgI"
+CHAT_ID      = "687693382"
 
-sent_links      = set()
-latest_pubdate  = {"SEC": None, "PRN": None}
+# SEC feeds for relevant forms
+SEC_FEEDS = [
+    {"type": "8-K",    "url": "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=8-K&output=atom"},
+    {"type": "S-4",    "url": "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=S-4&output=atom"},
+    {"type": "SC TO-C","url": "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=SC+TO-C&output=atom"},
+    {"type": "SC 13D","url": "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=SC+13D&output=atom"},
+    {"type": "DEFM14A","url": "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=DEFM14A&output=atom"}
+]
+
+# PR Newswire M&A-specific feed
+PRN_RSS_URL = (
+    "https://www.prnewswire.com/rss/financial-services-latest-news/"
+    "acquisitions-mergers-and-takeovers-list.rss"
+)
+
+# Semantic filters
+SEC_ITEMS_MA = ["Item 1.01", "Item 2.01", "Item 3.02", "Item 5.03"]
+SEC_KEYWORDS_POS = [
+    r"\bacquisition\b", r"\bmerger\b", r"\bwill acquire\b",
+    r"\btender offer\b", r"\bexchange offer\b"
+]
+SEC_KEYWORDS_NEG = [r"\bcompleted\b", r"\bclosed\b", r"\beffective as of\b"]
+POSITIVE_PRN = [
+    r"\b(acquisition|acquire|merger)\b",
+    r"\b(announc(?:e|ed) (?:deal|acquisition))\b"
+]
+NEGATIVE_PRN = [r"\b(complet(?:ed|ion)|closed|rebalancing)\b"]
+
+sent_links     = set()
+latest_pubdate = {f["type"]: None for f in SEC_FEEDS}
+latest_pubdate["PRN"] = None
 
 
-def send_telegram_message(message: str):
+def send_telegram_message(msg: str):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     resp = requests.post(url, data={
         'chat_id': CHAT_ID,
-        'text': message,
+        'text': msg,
         'parse_mode': 'Markdown',
         'disable_web_page_preview': False
     })
@@ -32,97 +56,86 @@ def send_telegram_message(message: str):
 
 
 def get_price_from_ticker(ticker: str):
-    """ Fetch current market price for given ticker """
     try:
-        tk = yf.Ticker(ticker)
-        price = tk.info.get("regularMarketPrice")
-        return price
+        return yf.Ticker(ticker).info.get("regularMarketPrice")
     except Exception:
         return None
 
 
 def extract_ticker(text: str):
-    """
-    Extract a stock ticker in format (NYSE:XYZ) or (NASDAQ:ABC) from text
-    """
     m = re.search(r"\((NYSE|NASDAQ|AMEX):\s*([A-Z\.]+)\)", text)
     return m.group(2) if m else None
 
 
 def parse_sec_feed():
-    global latest_pubdate
-    print("🔍 Checking SEC feed...")
-    feed = feedparser.parse(SEC_RSS_URL)
-    for entry in feed.entries[:15]:
-        link, title = entry.link, entry.title
-        pub = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
-        # skip old or duplicate
-        if link in sent_links or any(latest_pubdate["SEC"] and pub <= latest_pubdate["SEC"] for _ in (0,)):
-            continue
-        # only M&A forms
-        if not any(f in title for f in RELEVANT_FORMS):
-            continue
-
-        # extract company name
-        company = title.split(" - ")[0].strip()
-        # try to find ticker via company name
-        ticker, price = None, None
-        # SEC filings seldom include ticker in title, so fallback on yahoo search
-        try:
-            tk_obj = yf.Ticker(company)
-            price = tk_obj.info.get("regularMarketPrice")
-            ticker = tk_obj.info.get("symbol")
-        except Exception:
-            pass
-        if not ticker or not price:
-            # skip if not a listed company
-            continue
-
-        # build message
-        msg  = "📢 *New M&A announcement detected (SEC)!*\n"
-        msg += f"🏢 *Company:* {company} ({ticker})\n"
-        msg += f"📅 *Date:* {entry.published}\n"
-        msg += f"📈 *Current price:* ${price:.2f}\n"
-        msg += f"🔗 [Open Filing]({link})"
-
-        send_telegram_message(msg)
-        sent_links.add(link)
-        latest_pubdate["SEC"] = pub
+    for feed_info in SEC_FEEDS:
+        ftype, url = feed_info["type"], feed_info["url"]
+        feed = feedparser.parse(url)
+        for entry in feed.entries:
+            link, title = entry.link, entry.title
+            pub = datetime(*entry.updated_parsed[:6], tzinfo=timezone.utc)
+            # skip old or duplicates
+            if link in sent_links or (latest_pubdate[ftype] and pub <= latest_pubdate[ftype]):
+                continue
+            title_low = title.lower()
+            # for 8-K require specific items
+            if ftype == "8-K" and not any(item.lower() in title_low for item in SEC_ITEMS_MA):
+                continue
+            # semantic filters
+            if not any(re.search(p, title_low) for p in SEC_KEYWORDS_POS):
+                continue
+            if any(re.search(p, title_low) for p in SEC_KEYWORDS_NEG):
+                continue
+            # extract company, ticker, price
+            company = title.split(" - ")[0].strip()
+            ticker = price = None
+            try:
+                tk = yf.Ticker(company)
+                ticker = tk.info.get("symbol")
+                price = tk.info.get("regularMarketPrice")
+            except:
+                pass
+            if not ticker or price is None:
+                continue
+            # send message
+            msg = (
+                "📢 *New M&A announcement detected (SEC - " + ftype + ")!*\n"
+                f"🏢 *Company:* {company} ({ticker})\n"
+                f"📅 *Date:* {entry.updated}\n"
+                f"📈 *Current price:* ${price:.2f}\n"
+                f"🔗 [Open Filing]({link})"
+            )
+            send_telegram_message(msg)
+            sent_links.add(link)
+            latest_pubdate[ftype] = pub
 
 
 def parse_prn_feed():
-    global latest_pubdate
-    print("🔍 Checking PRNewswire feed...")
     feed = feedparser.parse(PRN_RSS_URL)
-    for entry in feed.entries[:15]:
+    for entry in feed.entries:
         link, title = entry.link, entry.title
         pub = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
-        # skip old or duplicate
-        if link in sent_links or any(latest_pubdate["PRN"] and pub <= latest_pubdate["PRN"] for _ in (0,)):
+        if link in sent_links or (latest_pubdate["PRN"] and pub <= latest_pubdate["PRN"]):
             continue
-        # must include M&A keyword
-        low = title.lower() + " " + entry.get("description","").lower()
-        if not any(k in low for k in PRN_KEYWORDS):
+        title_low = title.lower()
+        if not any(re.search(p, title_low) for p in POSITIVE_PRN):
             continue
-
-        # extract ticker from description
-        desc   = BeautifulSoup(entry.description, "html.parser").get_text()
+        if any(re.search(p, title_low) for p in NEGATIVE_PRN):
+            continue
+        desc = BeautifulSoup(entry.description, 'html.parser').get_text()
         ticker = extract_ticker(desc)
         if not ticker:
-            # skip private deals / non‐listed
             continue
-
         price = get_price_from_ticker(ticker)
-        if not price:
+        if price is None:
             continue
-
-        # build message
-        msg  = "📢 *New M&A announcement detected (PRNewswire)!*\n"
-        msg += f"🏢 *Title:* {title} ({ticker})\n"
-        msg += f"📅 *Date:* {entry.published}\n"
-        msg += f"📈 *Current price:* ${price:.2f}\n"
-        msg += f"🔗 [Read article]({link})"
-
+        msg = (
+            "📢 *New M&A announcement detected (PRNewswire)!*\n"
+            f"🏢 *Title:* {title} ({ticker})\n"
+            f"📅 *Date:* {entry.published}\n"
+            f"📈 *Current price:* ${price:.2f}\n"
+            f"🔗 [Read article]({link})"
+        )
         send_telegram_message(msg)
         sent_links.add(link)
         latest_pubdate["PRN"] = pub
