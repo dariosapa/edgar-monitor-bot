@@ -2,3 +2,4 @@ feedparser
 requests
 yfinance
 beautifulsoup4
+python-dotenv
