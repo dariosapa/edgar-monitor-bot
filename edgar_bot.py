@@ -70,7 +70,6 @@ def extract_ticker(text: str):
 
 
 def extract_offer_price(text: str):
-    # Cerca pattern come 'for $XX.XX', 'at $XX.XX', '$XX.XX per share'
     patterns = [
         r"for\s*\$\s*([0-9]+(?:\.[0-9]{1,2})?)",
         r"at\s*\$\s*([0-9]+(?:\.[0-9]{1,2})?)",
@@ -79,11 +78,27 @@ def extract_offer_price(text: str):
     for pat in patterns:
         m = re.search(pat, text, re.IGNORECASE)
         if m:
-            try:
-                return float(m.group(1))
-            except:
-                continue
+            try: return float(m.group(1))
+            except: pass
     return None
+
+# Initialize latest_pubdate to skip existing entries on first run
+
+def initialize_pubdates():
+    # SEC
+    for feed_info in SEC_FEEDS:
+        ftype, url = feed_info["type"], feed_info["url"]
+        feed = feedparser.parse(url)
+        if feed.entries:
+            entry = feed.entries[0]
+            ts = datetime(*entry.updated_parsed[:6], tzinfo=timezone.utc)
+            latest_pubdate[ftype] = ts
+    # PRN
+    feed = feedparser.parse(PRN_RSS_URL)
+    if feed.entries:
+        entry = feed.entries[0]
+        ts = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
+        latest_pubdate["PRN"] = ts
 
 # Parsing functions
 
@@ -98,31 +113,23 @@ def parse_sec_feed():
             if link in sent_links or (latest_pubdate[ftype] and pub <= latest_pubdate[ftype]):
                 continue
             title_low = title.lower()
-            # 8-K items filter
             if ftype == "8-K" and not any(item.lower() in title_low for item in SEC_ITEMS_MA):
                 continue
-            # semantic filters
             if not any(re.search(p, title_low) for p in SEC_KEYWORDS_POS):
                 continue
             if any(re.search(p, title_low) for p in SEC_KEYWORDS_NEG):
                 continue
 
-            # extract details
             company = title.split(" - ")[0].strip()
-            # summary may contain price terms
-            summary = getattr(entry, 'summary', '') or ''
+            summary = getattr(entry, 'summary', '')
             desc = BeautifulSoup(summary, 'html.parser').get_text()
             ticker = extract_ticker(desc)
             current_price = get_price_from_ticker(ticker) if ticker else None
-            # offered price and premium
             offer_price = extract_offer_price(desc)
-            premium = None
-            if offer_price and current_price:
-                premium = (offer_price - current_price) / current_price * 100
+            premium = (offer_price - current_price) / current_price * 100 if offer_price and current_price else None
             if not ticker or current_price is None:
                 continue
 
-            # build message
             msg = (
                 f"📢 *New M&A announcement detected (SEC - {ftype})!*\n"
                 f"🏢 *Company:* {company} ({ticker})\n"
@@ -131,10 +138,11 @@ def parse_sec_feed():
                 msg += f"💰 *Offered price:* ${offer_price:.2f}\n"
             if premium is not None:
                 msg += f"🔥 *Premium:* {premium:.1f}%\n"
-            msg += f"📈 *Current price:* ${current_price:.2f}\n"
-            msg += f"📅 *Date:* {entry.updated}\n"
-            msg += f"🔗 [Open Filing]({link})"
-
+            msg += (
+                f"📈 *Current price:* ${current_price:.2f}\n"
+                f"📅 *Date:* {entry.updated}\n"
+                f"🔗 [Open Filing]({link})"
+            )
             send_telegram_message(msg)
             sent_links.add(link)
             latest_pubdate[ftype] = pub
@@ -160,9 +168,7 @@ def parse_prn_feed():
             continue
         current_price = get_price_from_ticker(ticker)
         offer_price = extract_offer_price(desc)
-        premium = None
-        if offer_price and current_price:
-            premium = (offer_price - current_price) / current_price * 100
+        premium = (offer_price - current_price) / current_price * 100 if offer_price and current_price else None
         if current_price is None:
             continue
 
@@ -174,19 +180,21 @@ def parse_prn_feed():
             msg += f"💰 *Offered price:* ${offer_price:.2f}\n"
         if premium is not None:
             msg += f"🔥 *Premium:* {premium:.1f}%\n"
-        msg += f"📈 *Current price:* ${current_price:.2f}\n"
-        msg += f"📅 *Date:* {entry.published}\n"
-        msg += f"🔗 [Read article]({link})"
-
+        msg += (
+            f"📈 *Current price:* ${current_price:.2f}\n"
+            f"📅 *Date:* {entry.published}\n"
+            f"🔗 [Read article]({link})"
+        )
         send_telegram_message(msg)
         sent_links.add(link)
         latest_pubdate['PRN'] = pub
 
-# Main loop: re-analizza ogni 60 secondi
+# Main loop: initialize then re-check every 60 seconds
 
 def run_monitor():
-    print("🚀 M&A Pulse Bot is running...")
-    send_telegram_message("🟢 *Bot started: monitoring M&A with price, offer and premium*")
+    print("🚀 M&A Pulse Bot is starting... initializing latest timestamps")
+    initialize_pubdates()
+    send_telegram_message("🟢 *Bot started: now monitoring only new M&A deals from this moment* 🚀")
     while True:
         try:
             parse_sec_feed()
