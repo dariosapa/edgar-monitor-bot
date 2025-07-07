@@ -4,14 +4,18 @@ import time
 import yfinance as yf
 import re
 import json
-import os
 from bs4 import BeautifulSoup
 
 # === CONFIGURATION ===
 BOT_TOKEN = "7210512521:AAHMMoqnVfGP-3T2drsOvUi_FgXmxfTiNgI"
 CHAT_ID = "687693382"
-RELEVANT_FORMS = ["8-K", "SC TO-C", "S-4", "SC 13D", "DEFM14A"]
+
 SEC_RSS_URL = "https://www.sec.gov/Archives/edgar/usgaap.rss.xml"
+RELEVANT_FORMS = ["8-K", "SC TO-C", "S-4", "SC 13D", "DEFM14A"]
+
+PRN_RSS_URL = "https://www.prnewswire.com/rss/finance-business-news.rss"
+PRN_KEYWORDS = ["acquires", "acquisition", "buyout", "merger", "merging", "combine", "offer", "purchase"]
+
 HEADERS = {'User-Agent': 'M&A Pulse Bot (email@example.com)'}
 LINKS_FILE = "sent_links.json"
 sent_links = set()
@@ -44,7 +48,7 @@ def send_telegram_message(message: str):
     else:
         print("✅ Telegram message sent.")
 
-# === EDGAR PARSING ===
+# === PARSE FILING HTML ===
 def extract_price_info(filing_url: str):
     try:
         html = requests.get(filing_url, headers=HEADERS, timeout=10).text
@@ -85,60 +89,92 @@ def get_price_from_company_name(name: str):
 
     return None, None
 
-# === MAIN PARSER ===
+# === SEC MONITOR ===
 def check_edgar_feed():
-    feed = feedparser.parse(SEC_RSS_URL)
-    for entry in feed.entries[:15]:
-        title = entry.title
-        link = entry.link
-        published = entry.published
+    try:
+        feed = feedparser.parse(SEC_RSS_URL)
+        for entry in feed.entries[:15]:
+            title = entry.title
+            link = entry.link
+            published = entry.published
 
-        if link in sent_links:
-            continue
+            if link in sent_links:
+                continue
 
-        for form in RELEVANT_FORMS:
-            if form in title:
-                company = title.split(" - ")[0].strip()
-                price_offered, declared_premium = extract_price_info(link)
-                current_price, ticker = get_price_from_company_name(company)
+            for form in RELEVANT_FORMS:
+                if form in title:
+                    company = title.split(" - ")[0].strip()
+                    price_offered, declared_premium = extract_price_info(link)
+                    current_price, ticker = get_price_from_company_name(company)
 
-                msg = "📢 *New M&A announcement detected!*\n"
-                msg += f"📌 *Filing:* `{form}`\n"
-                msg += f"🏢 *Company:* {company}"
-                if ticker:
-                    msg += f" ({ticker})"
-                msg += f"\n📅 *Date:* {published}"
+                    msg = "📢 *New M&A announcement detected from SEC!*\n"
+                    msg += f"📌 *Filing:* `{form}`\n"
+                    msg += f"🏢 *Company:* {company}"
+                    if ticker:
+                        msg += f" ({ticker})"
+                    msg += f"\n📅 *Date:* {published}"
 
-                if price_offered:
-                    msg += f"\n💰 *Offer price:* ${price_offered:.2f}"
-                if current_price:
-                    msg += f"\n📈 *Current price:* ${current_price:.2f}"
-                if declared_premium is not None:
-                    msg += f"\n💹 *Stated premium:* +{declared_premium:.2f}%"
-                elif price_offered and current_price:
-                    calc_premium = ((price_offered - current_price) / current_price) * 100
-                    msg += f"\n💹 *Estimated premium:* +{calc_premium:.2f}%"
+                    if price_offered:
+                        msg += f"\n💰 *Offer price:* ${price_offered:.2f}"
+                    if current_price:
+                        msg += f"\n📈 *Current price:* ${current_price:.2f}"
+                    if declared_premium is not None:
+                        msg += f"\n💹 *Stated premium:* +{declared_premium:.2f}%"
+                    elif price_offered and current_price:
+                        calc_premium = ((price_offered - current_price) / current_price) * 100
+                        msg += f"\n💹 *Estimated premium:* +{calc_premium:.2f}%"
 
-                msg += f"\n🔗 [Open Filing]({link})"
+                    msg += f"\n🔗 [Open Filing]({link})"
 
-                send_telegram_message(msg)
-                sent_links.add(link)
-                save_sent_links()
-                print(f"✅ Sent: {company} ({form}) – {link}")
-                break
+                    send_telegram_message(msg)
+                    sent_links.add(link)
+                    save_sent_links()
+                    print(f"✅ SEC alert sent: {company} – {form}")
+                    break
+    except Exception as e:
+        print(f"❌ Error reading SEC feed: {e}")
 
-# === LOOP ===
+# === PRNEWSWIRE MONITOR ===
+def check_prn_feed():
+    try:
+        feed = feedparser.parse(PRN_RSS_URL)
+        for entry in feed.entries[:20]:
+            title = entry.title.lower()
+            link = entry.link
+
+            if link in sent_links:
+                continue
+
+            for keyword in PRN_KEYWORDS:
+                if keyword in title:
+                    msg = "📰 *Potential M&A news from PR Newswire!*\n"
+                    msg += f"🔑 *Keyword:* `{keyword}`\n"
+                    msg += f"🗞️ *Title:* {entry.title}\n"
+                    msg += f"🔗 [Read More]({link})"
+
+                    send_telegram_message(msg)
+                    sent_links.add(link)
+                    save_sent_links()
+                    print(f"✅ PRNewswire alert sent: {entry.title}")
+                    break
+    except Exception as e:
+        print(f"❌ Error reading PRNewswire feed: {e}")
+
+# === MAIN LOOP ===
 def run_monitor():
     while True:
         try:
-            print("🔍 Checking EDGAR feed...")
+            print("🔍 Checking SEC feed...")
             check_edgar_feed()
+            print("🔍 Checking PRNewswire feed...")
+            check_prn_feed()
         except Exception as e:
-            print(f"❌ Unexpected error: {e}")
+            print(f"❌ Unexpected error in main loop: {e}")
         time.sleep(60)
 
+# === START ===
 if __name__ == "__main__":
     print("🚀 M&A Pulse Bot is running...")
     load_sent_links()
-    send_telegram_message("🟢 *Bot started and monitoring EDGAR filings*")
+    send_telegram_message("🟢 *Bot started: monitoring SEC + PRNewswire*")
     run_monitor()
