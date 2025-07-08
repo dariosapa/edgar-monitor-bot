@@ -1,3 +1,4 @@
+# edgar_bot.py
 import feedparser
 import requests
 import re
@@ -29,7 +30,7 @@ NEGATIVE_PRN = [
 NOW = datetime.now(timezone.utc)
 TWO_DAYS_AGO = NOW - timedelta(days=2)
 
-# Utility function to send Telegram messages
+# Utility: send Telegram messages
 
 def send_telegram_message(msg: str):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -103,6 +104,6 @@ def parse_prn_last_two_days():
 
         send_telegram_message(msg)
 
-# Entry point for testing
+# Entry point
 if __name__ == "__main__":
     parse_prn_last_two_days()
