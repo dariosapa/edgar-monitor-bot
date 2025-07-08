@@ -5,29 +5,32 @@ from bs4 import BeautifulSoup
 from datetime import datetime, timedelta, timezone
 
 # === CONFIGURATION ===
-BOT_TOKEN = "YOUR_BOT_TOKEN"
-CHAT_ID = "YOUR_CHAT_ID"
+BOT_TOKEN = "7210512521:AAHMMoqnVfGP-3T2drsOvUi_FgXmxfTiNgI"
+CHAT_ID = "687693382"
 
-# Feeds
+# PR Newswire M&A feed
 PRN_RSS_URL = (
     "https://www.prnewswire.com/rss/financial-services-latest-news/"
     "acquisitions-mergers-and-takeovers-list.rss"
 )
 
-# Patterns
+# Regex patterns for ticker extraction and semantic filtering
 TICKER_REGEX = re.compile(
     r"\b\((NYSE|NASDAQ|AMEX|TSX(?:V)?|TSXV|OTCQB|OTCQX):\s*([A-Z\.\-]+)\)\b"
 )
 POSITIVE_PRN = [
     r"\b(completes acquisition of|to acquire|acquires|will acquire)\b"
 ]
-NEGATIVE_PRN = [r"\b(complet(?:ed|ion)|closed|rebalancing)\b"]
+NEGATIVE_PRN = [
+    r"\b(complet(?:ed|ion)|closed|rebalancing)\b"
+]
 
-# Time window
+# Time window: last 2 days
 NOW = datetime.now(timezone.utc)
 TWO_DAYS_AGO = NOW - timedelta(days=2)
 
-# Utility
+# Utility function to send Telegram messages
+
 def send_telegram_message(msg: str):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     resp = requests.post(url, data={
@@ -39,11 +42,13 @@ def send_telegram_message(msg: str):
     if resp.status_code != 200:
         print(f"❌ Telegram error: {resp.status_code} – {resp.text}")
 
+# Extract stock ticker from text
 
 def extract_ticker(text: str):
     m = TICKER_REGEX.search(text)
     return m.group(2) if m else None
 
+# Extract offer price from description
 
 def extract_offer_price(text: str):
     patterns = [
@@ -60,10 +65,9 @@ def extract_offer_price(text: str):
                 pass
     return None
 
-# Parse PR Newswire feed for last 2 days
+# Parse PR Newswire feed for entries in the last 2 days
 
 def parse_prn_last_two_days():
-    print("🔍 Parsing PR Newswire feed (last 2 days)...")
     feed = feedparser.parse(PRN_RSS_URL)
     for entry in feed.entries:
         pub = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
@@ -71,8 +75,8 @@ def parse_prn_last_two_days():
             continue
 
         title = entry.title
-        print(f"Checking entry: {title}")
         title_low = title.lower()
+        # Semantic filters
         if not any(re.search(p, title_low) for p in POSITIVE_PRN):
             continue
         if any(re.search(p, title_low) for p in NEGATIVE_PRN):
@@ -81,18 +85,24 @@ def parse_prn_last_two_days():
         desc = BeautifulSoup(entry.description, 'html.parser').get_text()
         ticker = extract_ticker(desc)
         if not ticker:
-            continue
+            continue  # skip non-public targets
 
         offer_price = extract_offer_price(desc)
+
+        # Compose and send message
         msg = (
             "📢 *New M&A (PRNewswire, last 2 days)*\n"
             f"🏢 *Title:* {title} ({ticker})\n"
         )
         if offer_price:
             msg += f"💰 *Offered price:* ${offer_price:.2f}\n"
-        msg += f"📅 *Date:* {entry.published}\n🔗 [Read article]({entry.link})"
+        msg += (
+            f"📅 *Date:* {entry.published}\n"
+            f"🔗 [Read article]({entry.link})"
+        )
 
         send_telegram_message(msg)
 
+# Entry point for testing
 if __name__ == "__main__":
     parse_prn_last_two_days()
