@@ -9,12 +9,9 @@ Options:
   --test-date YYYY-MM-DD    Run a one-shot test for that date (prints to stdout instead of Telegram).
   --backfill-days N         On real run, send all items from the last N days (backfill historical data).
 
-Ensure environment variables are defined:
-  BOT_TOKEN  - Telegram Bot API token
-  CHAT_ID    - Telegram chat ID to send messages
-  DB_PATH    - (optional) path to SQLite DB file, default "state.db"
+Configuration:
+  Modify BOT_TOKEN and CHAT_ID directly in the script before running. Ensure you keep the quotes.
 """
-import os
 import re
 import time
 import argparse
@@ -30,10 +27,7 @@ import yfinance as yf
 # === CONFIGURATION ===
 BOT_TOKEN = "7210512521:AAHMMoqnVfGP-3T2drsOvUi_FgXmxfTiNgI"  # Inserisci qui il tuo token
 CHAT_ID = "687693382"  # Inserisci qui il tuo chat ID
-DB_PATH = os.getenv("DB_PATH", "state.db")("DB_PATH", "state.db")
-
-if not BOT_TOKEN or not CHAT_ID:
-    raise SystemExit("Environment variables BOT_TOKEN and CHAT_ID must be set")
+DB_PATH = "state.db"  # Percorso al file SQLite per persistere lo stato
 
 # === FEEDS ===
 FEEDS = [
@@ -42,10 +36,10 @@ FEEDS = [
     {"name": "SEC SC TO-C", "url": "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=SC+TO-C&output=atom"},
     {"name": "SEC SC 13D", "url": "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=SC+13D&output=atom"},
     {"name": "SEC DEFM14A","url": "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=DEFM14A&output=atom"},
-    {"name": "PR Newswire", "url": "https://www.prnewswire.com/rss/Acquisitions-Mergers-and-Takeovers-list.rss"}
+    {"name": "PR Newswire M&A", "url": "https://www.prnewswire.com/rss/Acquisitions-Mergers-and-Takeovers-list.rss"}
 ]
 
-# === CONFIGURATION: Patterns ===
+# === PATTERNS ===
 POSITIVE_PATTERNS = [
     re.compile(p, re.IGNORECASE) for p in [
         r"\bacquisition\b", r"\bmerger\b", r"to acquire",
@@ -69,7 +63,7 @@ PRICE_REGEX = re.compile(r"\$\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)")
 
 # === LOGGING ===
 logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%dT%H:%M:%SZ"
 )
@@ -79,12 +73,14 @@ logger = logging.getLogger(__name__)
 def init_db(path: str):
     conn = sqlite3.connect(path)
     c = conn.cursor()
-    c.execute("""
+    c.execute(
+        """
         CREATE TABLE IF NOT EXISTS seen_links (
             link TEXT PRIMARY KEY,
             pub_date TEXT NOT NULL
         )
-    """)
+        """
+    )
     conn.commit()
     return conn
 
@@ -173,27 +169,26 @@ def process_entry(
         return
 
     title = entry.title or ''
-    raw_html = ('').join([c.value for c in entry.get('content', [])]) or entry.get('summary', '')
+    raw_html = ''.join([c.value for c in entry.get('content', [])]) or entry.get('summary', '')
     text = extract_text(raw_html)
     combined = f"{title}. {text}"
 
-    # Filter negative
+    # FILTERS
     if any(p.search(combined) for p in NEGATIVE_PATTERNS):
         mark_seen(conn, link, pub)
         return
-    # Require positive
     if not any(p.search(combined) for p in POSITIVE_PATTERNS):
         mark_seen(conn, link, pub)
         return
 
-    # Ticker resolution
+    # TICKER
     ticker = extract_ticker(text) or lookup_ticker(title)
 
-    # Build message
+    # BUILD MESSAGE
     msg = [
-        f"📢 *New M&A Alert ({feed_name})*",  
-        f"*Title:* {title}",  
-        f"*Date:* {pub.strftime('%Y-%m-%d %H:%M UTC')}",  
+        f"📢 *New M&A Alert ({feed_name})*",
+        f"*Title:* {title}",
+        f"*Date:* {pub.strftime('%Y-%m-%d %H:%M UTC')}",
         f"[Link]({link})"
     ]
     if ticker:
@@ -250,13 +245,13 @@ def main():
         cutoff = now
         test_mode = False
 
-    # One-pass for test/backfill
+    # ONE-PASS TEST/BACKFILL
     for feed in FEEDS:
         data = feedparser.parse(feed['url'])
         for entry in data.entries:
             process_entry(conn, cutoff, feed['name'], entry, test_mode)
 
-    # Continuous loop only for real run
+    # CONTINUOUS LOOP
     if not test_mode:
         send_telegram_message("🟢 *M&A Monitor avviato* 🚀")
         while True:
