@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-Real-time M&A Monitor with backfill support and persistent state.
+Real-time M&A Monitor with backfill support, persistent state, and first-run auto-backfill.
 
 Usage:
   python monitor.py [--test-date YYYY-MM-DD] [--backfill-days N]
 
 Options:
-  --test-date YYYY-MM-DD    Run a one-shot test for that date (prints to stdout instead of Telegram).
-  --backfill-days N         On real run, send all items from the last N days (backfill historical data).
+  --test-date YYYY-MM-DD    Run a one-shot test (prints to stdout instead of Telegram)
+  --backfill-days N         Send all items from the last N days on this run
 
 Configuration:
-  Modify BOT_TOKEN and CHAT_ID directly in the script before running. Ensure you keep the quotes.
+  Set your BOT_TOKEN and CHAT_ID below before running.
 """
 import re
 import time
@@ -25,9 +25,10 @@ from bs4 import BeautifulSoup
 import yfinance as yf
 
 # === CONFIGURATION ===
-BOT_TOKEN = "7210512521:AAHMMoqnVfGP-3T2drsOvUi_FgXmxfTiNgI"  # Inserisci qui il tuo token
-CHAT_ID = "687693382"  # Inserisci qui il tuo chat ID
-DB_PATH = "state.db"  # Percorso al file SQLite per persistere lo stato
+BOT_TOKEN = "7210512521:AAHMMoqnVfGP-3T2drsOvUi_FgXmxfTiNgI"  # Your Telegram bot token
+CHAT_ID = "687693382"  # Your Telegram chat ID
+DB_PATH = "state.db"  # SQLite file for storing seen links
+AUTO_BACKFILL_DAYS = 7  # On first run (empty DB), backfill this many days
 
 # === FEEDS ===
 FEEDS = [
@@ -162,14 +163,16 @@ def process_entry(
     test_mode: bool = False
 ):
     link = entry.link
-    pub_struct = entry.get('published_parsed') or entry.get('updated_parsed')
+    pub_struct = getattr(entry, 'published_parsed', None) or getattr(entry, 'updated_parsed', None)
+    if not pub_struct:
+        return
     pub = datetime(*pub_struct[:6], tzinfo=timezone.utc)
 
     if pub < cutoff or is_seen(conn, link):
         return
 
     title = entry.title or ''
-    raw_html = ''.join([c.value for c in entry.get('content', [])]) or entry.get('summary', '')
+    raw_html = ''.join([c.value for c in entry.get('content', [])]) or entry.get('summary', entry.get('description', ''))
     text = extract_text(raw_html)
     combined = f"{title}. {text}"
 
@@ -182,11 +185,11 @@ def process_entry(
         return
 
     # TICKER
-    ticker = extract_ticker(text) or lookup_ticker(title)
+    ticker = extract_ticker(text) or lookup_ticker(title) or lookup_ticker(text)
 
     # BUILD MESSAGE
     msg = [
-        f"📢 *New M&A Alert ({feed_name})*",
+        f"📢 *New M&A Alert ({feed_name})*!",
         f"*Title:* {title}",
         f"*Date:* {pub.strftime('%Y-%m-%d %H:%M UTC')}",
         f"[Link]({link})"
@@ -227,31 +230,39 @@ def main():
     parser.add_argument(
         "--backfill-days",
         type=int,
-        help="Real run: send all items from the last N days"
+        help="Send all items from the last N days (overrides auto-backfill)"
     )
     args = parser.parse_args()
 
     conn = init_db(DB_PATH)
     now = datetime.now(timezone.utc)
 
+    # Determine cutoff date
     if args.test_date:
         test_dt = datetime.strptime(args.test_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
         cutoff = test_dt - timedelta(seconds=1)
         test_mode = True
-    elif args.backfill_days:
-        cutoff = now - timedelta(days=args.backfill_days)
-        test_mode = False
     else:
-        cutoff = now
         test_mode = False
+        if args.backfill_days is not None:
+            cutoff = now - timedelta(days=args.backfill_days)
+        else:
+            # Auto-backfill on first run if no links seen
+            c = conn.cursor()
+            c.execute("SELECT COUNT(*) FROM seen_links")
+            count = c.fetchone()[0]
+            if count == 0:
+                cutoff = now - timedelta(days=AUTO_BACKFILL_DAYS)
+            else:
+                cutoff = now
 
-    # ONE-PASS TEST/BACKFILL
+    # One-pass processing
     for feed in FEEDS:
         data = feedparser.parse(feed['url'])
         for entry in data.entries:
             process_entry(conn, cutoff, feed['name'], entry, test_mode)
 
-    # CONTINUOUS LOOP
+    # Continuous loop for real runs
     if not test_mode:
         send_telegram_message("🟢 *M&A Monitor avviato* 🚀")
         while True:
