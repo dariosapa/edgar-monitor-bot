@@ -1,286 +1,274 @@
 #!/usr/bin/env python3
 """
-Real-time M&A Monitor for SEC filings and PR Newswire.
-Enhanced version with improved ticker extraction and deal detection.
+Real-time M&A Monitor with backfill support and persistent state.
+
+Usage:
+  python monitor.py [--test-date YYYY-MM-DD] [--backfill-days N]
+
+Options:
+  --test-date YYYY-MM-DD    Run a one-shot test for that date (prints to stdout instead of Telegram).
+  --backfill-days N         On real run, send all items from the last N days (backfill historical data).
+
+Ensure environment variables are defined:
+  BOT_TOKEN  - Telegram Bot API token
+  CHAT_ID    - Telegram chat ID to send messages
+  DB_PATH    - (optional) path to SQLite DB file, default "state.db"
 """
 import os
 import re
 import time
-import logging
 import argparse
+import sqlite3
+import logging
+from datetime import datetime, timezone, timedelta
+
 import requests
 import feedparser
 from bs4 import BeautifulSoup
-from datetime import datetime, timezone, timedelta
 import yfinance as yf
-import urllib.parse
 
 # === CONFIGURATION ===
-BOT_TOKEN = os.getenv("BOT_TOKEN", "7210512521:AAHMMoqnVfGP-3T2drsOvUi_FgXmxfTiNgI")
-CHAT_ID = os.getenv("CHAT_ID", "687693382")
-TEST_DATE = os.getenv("TEST_DATE", "2025-07-11")
+BOT_TOKEN = "7210512521:AAHMMoqnVfGP-3T2drsOvUi_FgXmxfTiNgI"  # Inserisci qui il tuo token
+CHAT_ID = "687693382"  # Inserisci qui il tuo chat ID
+DB_PATH = os.getenv("DB_PATH", "state.db")("DB_PATH", "state.db")
 
-# Feeds to monitor
+if not BOT_TOKEN or not CHAT_ID:
+    raise SystemExit("Environment variables BOT_TOKEN and CHAT_ID must be set")
+
+# === FEEDS ===
 FEEDS = [
-    {"name": "SEC 8-K", "url": "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=8-K&output=atom"},
-    {"name": "SEC S-4", "url": "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=S-4&output=atom"},
+    {"name": "SEC 8-K",    "url": "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=8-K&output=atom"},
+    {"name": "SEC S-4",    "url": "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=S-4&output=atom"},
     {"name": "SEC SC TO-C", "url": "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=SC+TO-C&output=atom"},
     {"name": "SEC SC 13D", "url": "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=SC+13D&output=atom"},
-    {"name": "SEC DEFM14A", "url": "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=DEFM14A&output=atom"},
-    {"name": "PR Newswire M&A", "url": "https://www.prnewswire.com/rss/Acquisitions-Mergers-and-Takeovers-list.rss"}
+    {"name": "SEC DEFM14A","url": "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=DEFM14A&output=atom"},
+    {"name": "PR Newswire", "url": "https://www.prnewswire.com/rss/Acquisitions-Mergers-and-Takeovers-list.rss"}
 ]
 
-# Enhanced keywords for detection
-POSITIVE_KEYWORDS = [
-    r"\bacquisition\b", r"\bmerger\b", r"\bacqui(re|sition|ring)\b", 
-    r"\bto acquire\b", r"\bacquires\b", r"\bbuyout\b", r"\btakeover\b",
-    r"\bmerger of equals\b", r"\bstock[- ]for[- ]stock\b", r"\btender offer\b",
-    r"\bexchange offer\b", r"\benters into (exclusive )?discussions\b",
-    r"\bproposed acquisition\b", r"\bagreement to acquire\b", r"\bdefinitive agreement\b"
+# === CONFIGURATION: Patterns ===
+POSITIVE_PATTERNS = [
+    re.compile(p, re.IGNORECASE) for p in [
+        r"\bacquisition\b", r"\bmerger\b", r"to acquire",
+        r"acqu(?:ire|sition|ring)", r"buyout", r"takeover",
+        r"merger of equals", r"stock[- ]for[- ]stock",
+        r"tender offer", r"exchange offer",
+        r"enters into exclusive discussions", r"definitive agreement"
+    ]
 ]
-NEGATIVE_KEYWORDS = [
-    r"\bcompleted\b", r"\bclosing(?: of)?\b", r"\beffective as of\b",
-    r"\bfinalized\b", r"\bconcluded\b", r"\bsettled\b"
+NEGATIVE_PATTERNS = [
+    re.compile(p, re.IGNORECASE) for p in [
+        r"\bcompleted\b", r"closing of", r"effective as of",
+        r"finalized", r"concluded"
+    ]
 ]
-
-# Enhanced regex for ticker extraction
 TICKER_REGEX = re.compile(
-    r"(?:NYSE|NASDAQ|AMEX|OTC(?:QB|QX)?|TSX(?:V)?|NEO):?\s*([A-Z]{1,5}(?:\.[A-Z]{1,2})?)\b",
+    r"(?:NYSE|NASDAQ|AMEX|OTC(?:QB|QX)?|TSX(?:V)?|NEO):?\s*([A-Z0-9\.\-]{1,5})\b",
     re.IGNORECASE
 )
+PRICE_REGEX = re.compile(r"\$\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)")
 
-# Improved patterns for offer price extraction
-PRICE_PATTERNS = [
-    r"\$\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)",
-    r"for\s*\$\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)",
-    r"at\s*\$\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)",
-    r"per share\s*\$\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)",
-    r"consideration of\s*\$\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)",
-    r"price of\s*\$\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)"
-]
-
-# State trackers
-t_sent_links = set()
-latest_dates = {}
-
-# Logging setup
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+# === LOGGING ===
 logging.basicConfig(
-    level=LOG_LEVEL,
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%dT%H:%M:%SZ"
 )
+logger = logging.getLogger(__name__)
 
-# Precompile regex patterns for performance
-POSITIVE_PATTERNS = [re.compile(p, re.IGNORECASE) for p in POSITIVE_KEYWORDS]
-NEGATIVE_PATTERNS = [re.compile(p, re.IGNORECASE) for p in NEGATIVE_KEYWORDS]
-PRICE_REGEXES = [re.compile(p, re.IGNORECASE) for p in PRICE_PATTERNS]
+# === STATE PERSISTENCE ===
+def init_db(path: str):
+    conn = sqlite3.connect(path)
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS seen_links (
+            link TEXT PRIMARY KEY,
+            pub_date TEXT NOT NULL
+        )
+    """)
+    conn.commit()
+    return conn
 
+
+def is_seen(conn: sqlite3.Connection, link: str) -> bool:
+    c = conn.cursor()
+    c.execute("SELECT 1 FROM seen_links WHERE link = ?", (link,))
+    return c.fetchone() is not None
+
+
+def mark_seen(conn: sqlite3.Connection, link: str, pub: datetime):
+    c = conn.cursor()
+    c.execute(
+        "INSERT OR IGNORE INTO seen_links(link, pub_date) VALUES (?, ?)",
+        (link, pub.isoformat())
+    )
+    conn.commit()
+
+# === NOTIFICATION ===
 def send_telegram_message(text: str):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"}
     try:
         resp = requests.post(url, data=payload, timeout=10)
         if resp.status_code != 200:
-            logging.error(f"Telegram API error {resp.status_code}: {resp.text}")
+            logger.error(f"Telegram API error {resp.status_code}: {resp.text}")
     except Exception as e:
-        logging.error(f"Failed to send Telegram message: {e}")
+        logger.error(f"Failed to send Telegram message: {e}")
 
-def get_market_price(ticker: str):
-    try:
-        stock = yf.Ticker(ticker)
-        # Try regular market price first, then previous close
-        return stock.info.get("regularMarketPrice") or stock.info.get("previousClose")
-    except Exception as e:
-        logging.warning(f"Failed to fetch market price for {ticker}: {e}")
-        return None
+# === DATA EXTRACTION ===
+def extract_text(html: str) -> str:
+    return BeautifulSoup(html, "lxml").get_text(separator=" ")
 
-def extract_offer_price(text: str):
-    for regex in PRICE_REGEXES:
-        matches = regex.findall(text)
-        if matches:
-            try:
-                # Take the first match and remove commas
-                price_str = matches[0].replace(',', '')
-                return float(price_str)
-            except (ValueError, IndexError):
-                continue
-    return None
 
-def extract_ticker(text: str):
+def extract_ticker(text: str) -> str:
     m = TICKER_REGEX.search(text)
     return m.group(1).upper().replace('.', '-') if m else None
 
-def fetch_full_text_ticker(url: str):
-    try:
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3'}
-        r = requests.get(url, headers=headers, timeout=15)
-        if r.ok:
-            full_text = BeautifulSoup(r.text, "html.parser").get_text()
-            return extract_ticker(full_text)
-    except Exception as e:
-        logging.warning(f"Fallback ticker fetch failed for {url}: {e}")
-    return None
 
-def lookup_ticker_by_name(name: str):
-    if not name:
-        return None
-        
+def lookup_ticker(name: str) -> str:
     try:
-        query = urllib.parse.quote(name)
-        url = f"https://query2.finance.yahoo.com/v1/finance/search?q={query}"
+        q = requests.utils.quote(name)
+        url = f"https://query2.finance.yahoo.com/v1/finance/search?q={q}"
         r = requests.get(url, timeout=10)
-        data = r.json()
-        
-        # First try exact match
-        for item in data.get("quotes", []):
-            if item.get("longname", "").lower() == name.lower():
-                return item.get("symbol")
-                
-        # Then try close matches
-        for item in data.get("quotes", []):
-            symbol = item.get("symbol")
-            exch = item.get("exchange")
-            # Validate exchange and symbol format
-            if symbol and len(symbol) <= 5 and exch in {"NMS", "NYQ", "ASE", "NCM", "TSX", "TSXV"}:
-                return symbol
+        items = r.json().get('quotes', [])
+        for itm in items:
+            if itm.get('symbol') and itm.get('exchange') in {"NMS","NYQ","ASE","AMEX","TSX","TSXV"}:
+                return itm['symbol']
     except Exception as e:
-        logging.warning(f"Name lookup failed for '{name}': {e}")
+        logger.warning(f"Yahoo lookup failed for '{name}': {e}")
     return None
 
-def extract_target_name(text: str):
-    patterns = [
-        r"to\s+acquire\s+([\w\s&'\.-]{5,40}?)\b",
-        r"acqui(sition|ring)\s+of\s+([\w\s&'\.-]{5,40}?)\b",
-        r"merger\s+with\s+([\w\s&'\.-]{5,40}?)\b",
-        r"agreement\s+to\s+acquire\s+([\w\s&'\.-]{5,40}?)\b",
-        r"enters into discussions to acquire ([\w\s&'\.-]{5,40}?)\b"
-    ]
-    
-    for pat in patterns:
-        m = re.search(pat, text, re.IGNORECASE)
-        if m:
-            # Handle patterns with different group numbers
-            target = m.group(1) if len(m.groups()) == 1 else m.group(2)
-            # Clean up extracted name
-            clean_name = re.sub(r'\s*[.,;:]\s*$', '', target.strip())
-            clean_name = re.sub(r'\b(?:llc|inc|plc|corp|co|company)\b', '', clean_name, flags=re.IGNORECASE).strip()
-            return clean_name
-    return None
 
-def init_latest_dates():
-    now = datetime.now(timezone.utc)
-    for feed in FEEDS:
-        latest_dates[feed['name']] = now
+def get_market_price(ticker: str) -> float:
+    try:
+        info = yf.Ticker(ticker).info
+        return info.get('regularMarketPrice') or info.get('previousClose')
+    except Exception as e:
+        logger.warning(f"Market price fetch failed for {ticker}: {e}")
+        return None
 
-def process_entry(feed_name: str, entry):
+
+def extract_offer_price(text: str) -> float:
+    m = PRICE_REGEX.search(text)
+    if not m:
+        return None
+    s = m.group(1).replace(',', '')
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+# === ENTRY PROCESSING ===
+def process_entry(
+    conn: sqlite3.Connection,
+    cutoff: datetime,
+    feed_name: str,
+    entry,
+    test_mode: bool = False
+):
     link = entry.link
-    pub = datetime(*entry.updated_parsed[:6], tzinfo=timezone.utc) if hasattr(entry, 'updated_parsed') else datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
+    pub_struct = entry.get('published_parsed') or entry.get('updated_parsed')
+    pub = datetime(*pub_struct[:6], tzinfo=timezone.utc)
 
-    if pub <= latest_dates[feed_name] or link in t_sent_links:
+    if pub < cutoff or is_seen(conn, link):
         return
 
-    title = (entry.title or "").strip()
-    raw_html = entry.content[0].value if hasattr(entry, 'content') and entry.content else entry.get('summary', entry.get('description', ''))
-    content = BeautifulSoup(raw_html, "html.parser").get_text()
-    text_to_check = f"{title}. {content}".lower()
+    title = entry.title or ''
+    raw_html = ('').join([c.value for c in entry.get('content', [])]) or entry.get('summary', '')
+    text = extract_text(raw_html)
+    combined = f"{title}. {text}"
 
-    # Skip if any negative keyword is found
-    if any(pat.search(text_to_check) for pat in NEGATIVE_PATTERNS):
-        logging.debug(f"Skipping due to negative keyword: {title}")
-        latest_dates[feed_name] = max(latest_dates[feed_name], pub)
+    # Filter negative
+    if any(p.search(combined) for p in NEGATIVE_PATTERNS):
+        mark_seen(conn, link, pub)
         return
-        
-    # Check for positive keywords
-    if not any(pat.search(text_to_check) for pat in POSITIVE_PATTERNS):
-        logging.debug(f"No positive keywords found: {title}")
-        latest_dates[feed_name] = max(latest_dates[feed_name], pub)
+    # Require positive
+    if not any(p.search(combined) for p in POSITIVE_PATTERNS):
+        mark_seen(conn, link, pub)
         return
 
-    # Extract ticker through multiple methods
-    ticker = extract_ticker(content)
-    if not ticker:
-        ticker = fetch_full_text_ticker(link)
-    if not ticker:
-        target = extract_target_name(title) or extract_target_name(content)
-        if target:
-            ticker = lookup_ticker_by_name(target)
-    if not ticker:
-        ticker = lookup_ticker_by_name(title)
+    # Ticker resolution
+    ticker = extract_ticker(text) or lookup_ticker(title)
 
-    # Prepare notification
+    # Build message
     msg = [
-        f"📢 *New M&A Alert ({feed_name})!*",
-        f"🏢 *Title:* {title}",
-        f"📅 *Date:* {pub.strftime('%Y-%m-%d %H:%M UTC')}",
-        f"🔗 [Link]({link})"
+        f"📢 *New M&A Alert ({feed_name})*",  
+        f"*Title:* {title}",  
+        f"*Date:* {pub.strftime('%Y-%m-%d %H:%M UTC')}",  
+        f"[Link]({link})"
     ]
-    
-    # Add ticker information
     if ticker:
-        msg.insert(2, f"🎯 *Ticker:* {ticker}")
-        market_price = get_market_price(ticker)
-        offer_price = extract_offer_price(content)
-        
-        if offer_price is not None:
-            msg.append(f"💰 *Offer Price:* ${offer_price:.2f}")
-        if market_price is not None:
-            msg.append(f"📈 *Market Price:* ${market_price:.2f}")
-        if offer_price is not None and market_price is not None:
+        msg.insert(2, f"*Ticker:* {ticker}")
+        offer = extract_offer_price(text)
+        market = get_market_price(ticker)
+        if offer is not None:
+            msg.append(f"*Offer Price:* ${offer:.2f}")
+        if market is not None:
+            msg.append(f"*Market Price:* ${market:.2f}")
+        if offer and market:
             try:
-                premium_pct = (offer_price - market_price) / market_price * 100
-                msg.append(f"🔥 *Premium:* {premium_pct:.1f}%")
+                prem = (offer - market) / market * 100
+                msg.append(f"*Premium:* {prem:.1f}%")
             except ZeroDivisionError:
                 pass
     else:
-        msg.insert(2, "🎯 *Ticker:* 🔍 (Ricerca in corso)")
-        
-        # Try to extract target name for additional context
-        target = extract_target_name(title) or extract_target_name(content)
-        if target:
-            msg.append(f"🎯 *Potential Target:* {target}")
+        msg.insert(2, "*Ticker:* 🔍 ricerca in corso")
 
-    send_telegram_message("\n".join(msg))
-    t_sent_links.add(link)
-    latest_dates[feed_name] = max(latest_dates[feed_name], pub)
-    logging.info(f"Notification sent for: {title}")
+    text_msg = "\n".join(msg)
+    if test_mode:
+        print("[TEST NOTIFICATION]\n" + text_msg + "\n")
+    else:
+        send_telegram_message(text_msg)
 
-def test_for_date(date_str: str):
-    test_dt = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-    for k in latest_dates:
-        latest_dates[k] = test_dt - timedelta(seconds=1)
-    global send_telegram_message
-    send_telegram_message = lambda text: print(f"[TEST NOTIFICATION]\n{text}\n")
+    mark_seen(conn, link, pub)
+    logger.info(f"Notification sent for: {title}")
+
+# === MAIN ===
+def main():
+    parser = argparse.ArgumentParser(description="Real-time M&A Monitor")
+    parser.add_argument(
+        "--test-date",
+        help="One-shot test for date YYYY-MM-DD (prints to stdout)"
+    )
+    parser.add_argument(
+        "--backfill-days",
+        type=int,
+        help="Real run: send all items from the last N days"
+    )
+    args = parser.parse_args()
+
+    conn = init_db(DB_PATH)
+    now = datetime.now(timezone.utc)
+
+    if args.test_date:
+        test_dt = datetime.strptime(args.test_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        cutoff = test_dt - timedelta(seconds=1)
+        test_mode = True
+    elif args.backfill_days:
+        cutoff = now - timedelta(days=args.backfill_days)
+        test_mode = False
+    else:
+        cutoff = now
+        test_mode = False
+
+    # One-pass for test/backfill
     for feed in FEEDS:
-        logging.info(f"Processing feed: {feed['name']}")
         data = feedparser.parse(feed['url'])
-        logging.info(f"Found {len(data.entries)} entries")
         for entry in data.entries:
-            process_entry(feed['name'], entry)
+            process_entry(conn, cutoff, feed['name'], entry, test_mode)
 
-def run():
-    init_latest_dates()
-    send_telegram_message("🟢 *M&A Monitor started*: watching SEC & PR Newswire 🚀")
-    logging.info("Monitoring started")
-    while True:
-        try:
-            for feed in FEEDS:
-                logging.debug(f"Checking feed: {feed['name']}")
-                data = feedparser.parse(feed['url'])
-                for entry in data.entries:
-                    process_entry(feed['name'], entry)
-            time.sleep(60)
-        except Exception as e:
-            logging.error(f"Main loop error: {e}")
-            time.sleep(300)  # Wait longer on error
+    # Continuous loop only for real run
+    if not test_mode:
+        send_telegram_message("🟢 *M&A Monitor avviato* 🚀")
+        while True:
+            try:
+                for feed in FEEDS:
+                    data = feedparser.parse(feed['url'])
+                    for entry in data.entries:
+                        process_entry(conn, cutoff, feed['name'], entry)
+                time.sleep(60)
+            except Exception as e:
+                logger.error(f"Main loop error: {e}")
+                time.sleep(300)
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="M&A Monitor")
-    parser.add_argument("--test-date", help="Run a single test pass for given date 2025-07-11")
-    args = parser.parse_args()
-    date_to_test = args.test_date or TEST_DATE
-    if date_to_test:
-        init_latest_dates()
-        test_for_date(date_to_test)
-    else:
-        run()
+    main()
