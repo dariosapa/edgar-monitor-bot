@@ -217,7 +217,7 @@ def run():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="M&A Monitor")
-    parser.add_argument("--test-date", help="Run a single test pass for given date 2025-07-10")
+    parser.add_argument("--test-date", help="Run a single test pass for given date 2025-07-11")
     args = parser.parse_args()
 
     if args.test_date:
