@@ -21,17 +21,17 @@ import urllib.parse
 
 # === CONFIGURATION ===
 BOT_TOKEN = os.getenv("BOT_TOKEN", "7210512521:AAHMMoqnVfGP-3T2drsOvUi_FgXmxfTiNgI")  # Telegram bot token
-CHAT_ID   = os.getenv("CHAT_ID",   "687693382")      # Telegram chat ID
-# Data di test predefinita (YYYY-MM-DD)
-TEST_DATE = os.getenv("TEST_DATE", "2025-07-11")
+CHAT_ID = os.getenv("CHAT_ID", "687693382")  # Telegram chat ID
+# Default TEST_DATE is None: only enable test mode if env var or CLI flag provided
+TEST_DATE = os.getenv("TEST_DATE", "2025-07-11")  # e.g. "2025-07-11"
 
 # Feeds to monitor
 FEEDS = [
-    {"name": "SEC 8-K",     "url": "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=8-K&output=atom"},
-    {"name": "SEC S-4",     "url": "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=S-4&output=atom"},
+    {"name": "SEC 8-K", "url": "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=8-K&output=atom"},
+    {"name": "SEC S-4", "url": "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=S-4&output=atom"},
     {"name": "SEC SC TO-C", "url": "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=SC+TO-C&output=atom"},
-    {"name": "SEC SC 13D","url": "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=SC+13D&output=atom"},
-    {"name": "SEC DEFM14A","url": "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=DEFM14A&output=atom"},
+    {"name": "SEC SC 13D", "url": "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=SC+13D&output=atom"},
+    {"name": "SEC DEFM14A", "url": "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=DEFM14A&output=atom"},
     {"name": "PR Newswire M&A", "url": "https://www.prnewswire.com/rss/Acquisitions-Mergers-and-Takeovers-list.rss"}
 ]
 
@@ -46,7 +46,7 @@ NEGATIVE_KEYWORDS = [
     r"\bsubject to closing conditions\b"
 ]
 
-# Regex for ticker extraction, extended to common exchanges
+# Regex for ticker extraction
 TICKER_REGEX = re.compile(
     r"\b(?:NYSE(?:\sAmerican)?|NASDAQ|AMEX|TSX(?:V)?|TSXV|OTCQB|OTCQX):\s*([A-Z\.\-]+)\b",
     re.IGNORECASE
@@ -160,32 +160,25 @@ def process_entry(feed_name: str, entry):
         return
 
     title = (entry.title or "").strip()
-    if hasattr(entry, 'content') and entry.content:
-        raw_html = entry.content[0].value
-    else:
-        raw_html = entry.get('summary', entry.get('description', ''))
+    raw_html = entry.content[0].value if hasattr(entry, 'content') and entry.content else entry.get('summary', entry.get('description', ''))
     content = BeautifulSoup(raw_html, "html.parser").get_text()
     tl = title.lower()
 
     if any(re.search(p, tl) for p in NEGATIVE_KEYWORDS):
-        logging.info(f"SKIP [{feed_name}] {link} - negative keyword")
         latest_dates[feed_name] = max(latest_dates[feed_name], pub)
         return
     if not any(re.search(p, tl) for p in POSITIVE_KEYWORDS):
-        logging.info(f"SKIP [{feed_name}] {link} - no positive keyword")
         latest_dates[feed_name] = max(latest_dates[feed_name], pub)
         return
 
     ticker = extract_ticker(content) or fetch_full_text_ticker(link)
     if not ticker:
         target = extract_target_name(title)
-        if target:
-            ticker = lookup_ticker_by_name(target)
+        ticker = lookup_ticker_by_name(target) if target else None
     if not ticker:
         ticker = lookup_ticker_by_name(title)
 
     if not ticker:
-        logging.warning(f"Ticker non trovato per '{title}', invio notifica grezza")
         msg = [
             f"📢 *New M&A Alert ({feed_name})!*",
             f"🏢 *Title:* {title}",
@@ -201,7 +194,7 @@ def process_entry(feed_name: str, entry):
     market_price = get_market_price(ticker)
     offer_price = extract_offer_price(content)
     premium_pct = None
-    if market_price and offer_price:
+    if market_price is not None and offer_price is not None:
         try:
             premium_pct = (offer_price - market_price) / market_price * 100
         except ZeroDivisionError:
@@ -212,10 +205,49 @@ def process_entry(feed_name: str, entry):
         f"🏢 *Title:* {title}",
         f"🎯 *Ticker:* {ticker}"
     ]
-    if offer_price:    msg.append(f"💰 *Offer Price:* ${offer_price:.2f}")
-    if market_price:   msg.append(f"📈 *Market Price:* ${market_price:.2f}")
-    if premium_pct is not None: msg.append(f"🔥 *Premium:* {premium_pct:.1f}%")
+    if offer_price is not None:
+        msg.append(f"💰 *Offer Price:* ${offer_price:.2f}")
+    if market_price is not None:
+        msg.append(f"📈 *Market Price:* ${market_price:.2f}")
+    if premium_pct is not None:
+        msg.append(f"🔥 *Premium:* {premium_pct:.1f}%")
     msg.extend([f"📅 *Date:* {pub.isoformat()}", f"🔗 [Link]({link})"])
 
     send_telegram_message("\n".join(msg))
     t_sent_links.add(link)
+    latest_dates[feed_name] = max(latest_dates[feed_name], pub)
+
+
+def test_for_date(date_str: str):
+    test_dt = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    for k in latest_dates:
+        latest_dates[k] = test_dt - timedelta(seconds=1)
+    global send_telegram_message
+    send_telegram_message = lambda text: print(f"[TEST NOTIFICATION]\n{text}\n")
+    for feed in FEEDS:
+        data = feedparser.parse(feed['url'])
+        for entry in data.entries:
+            process_entry(feed['name'], entry)
+
+
+def run():
+    init_latest_dates()
+    send_telegram_message("🟢 *M&A Monitor started*: watching SEC & PR Newswire 🚀")
+    while True:
+        for feed in FEEDS:
+            data = feedparser.parse(feed['url'])
+            for entry in data.entries:
+                process_entry(feed['name'], entry)
+        time.sleep(60)
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="M&A Monitor")
+    parser.add_argument("--test-date", help="Run a single test pass for given date 2025-07-11")
+    args = parser.parse_args()
+    date_to_test = args.test_date or TEST_DATE
+    if date_to_test:
+        init_latest_dates()
+        test_for_date(date_to_test)
+    else:
+        run()
+
