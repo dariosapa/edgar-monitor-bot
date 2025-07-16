@@ -3,7 +3,6 @@
 Real-time M&A Monitor for SEC filings and PR Newswire.
 Optimized for Railway.app deployment with strict target filtering and state persistence.
 """
-
 import os
 import re
 import time
@@ -27,16 +26,16 @@ DATABASE = os.getenv("DATABASE", "ma_monitor.db")
 
 # Feeds to monitor
 FEEDS = [
-    {"name": "SEC 8-K",       "url": "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=8-K&output=atom"},
-    {"name": "SEC S-4",       "url": "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=S-4&output=atom"},
-    {"name": "SEC SC TO-C",   "url": "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=SC+TO-C&output=atom"},
-    {"name": "SEC SC 13D",    "url": "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=SC+13D&output=atom"},
-    {"name": "SEC DEFM14A",   "url": "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=DEFM14A&output=atom"},
-    {"name": "PR Newswire M&A","url": "https://www.prnewswire.com/rss/Acquisitions-Mergers-and-Takeovers-list.rss"}
+    {"name": "SEC 8-K",        "url": "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=8-K&output=atom"},
+    {"name": "SEC S-4",        "url": "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=S-4&output=atom"},
+    {"name": "SEC SC TO-C",    "url": "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=SC+TO-C&output=atom"},
+    {"name": "SEC SC 13D",     "url": "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=SC+13D&output=atom"},
+    {"name": "SEC DEFM14A",    "url": "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=DEFM14A&output=atom"},
+    {"name": "PR Newswire M&A", "url": "https://www.prnewswire.com/rss/Acquisitions-Mergers-and-Takeovers-list.rss"}
 ]
 
 # Logging setup
-ing logging.basicConfig(
+logging.basicConfig(
     level=LOG_LEVEL,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%dT%H:%M:%SZ"
@@ -76,7 +75,7 @@ NEGATIVE_PATTERNS = [
     re.compile(r"\b(product launch|event|partnership|sponsorship)\b", re.IGNORECASE)
 ]
 
-# Ticker regex (fixed)
+# Ticker regex
 TICKER_REGEX = re.compile(
     r"(?:NYSE|NASDAQ|AMEX|OTC(?:QB|QX)?|TSX(?:V)?|NEO):?\s*([A-Z]{1,5}(?:\.[A-Z]{1,2})?)\b",
     re.IGNORECASE
@@ -84,7 +83,6 @@ TICKER_REGEX = re.compile(
 
 # Caches and state
 _equity_cache = {}
-latest_dates = {}
 
 # --- Database functions ---
 def init_db():
@@ -106,7 +104,7 @@ def load_sent_links():
 def save_sent_link(link):
     conn = sqlite3.connect(DATABASE)
     c = conn.cursor()
-    c.execute("INSERT OR IGNORE INTO sent_links VALUES (?)", (link,))
+    c.execute("INSERT OR IGNORE INTO sent_links (link) VALUES (?)", (link,))
     conn.commit()
     conn.close()
 
@@ -121,7 +119,7 @@ def load_latest_dates():
 def save_latest_date(feed_name, dt):
     conn = sqlite3.connect(DATABASE)
     c = conn.cursor()
-    c.execute("INSERT OR REPLACE INTO latest_dates VALUES (?, ?)", (feed_name, dt.isoformat()))
+    c.execute("INSERT OR REPLACE INTO latest_dates (feed_name, date) VALUES (?, ?)", (feed_name, dt.isoformat()))
     conn.commit()
     conn.close()
 
@@ -167,7 +165,7 @@ def lookup_ticker_by_name(name):
     try:
         q = urllib.parse.quote(name)
         url = f"https://query2.finance.yahoo.com/v1/finance/search?q={q}"
-        r = requests.get(url, timeout=15)
+        r = requests.get(url, timeout=15);
         r.raise_for_status()
         for item in r.json().get("quotes", []):
             if item.get("quoteType") == "EQUITY":
@@ -180,10 +178,12 @@ def is_listed_equity(ticker):
     if ticker in _equity_cache:
         return _equity_cache[ticker]
     try:
-        eq = yf.Ticker(ticker).info.get("quoteType") == "EQUITY"
+        info = yf.Ticker(ticker).info
+        result = info.get("quoteType") == "EQUITY"
     except Exception:
-        eq = False
-    _equity_cache[ticker] = eq
-    return eq
+        result = False
+    _equity_cache[ticker] = result
+    return result
 
+# --- State initialization ---
 
